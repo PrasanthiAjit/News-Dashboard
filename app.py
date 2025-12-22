@@ -9,39 +9,52 @@ from datetime import datetime
 from typing import List, Dict
 import difflib
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
 
 st.set_page_config(page_title="Global Tech & Science Headlines", layout="wide")
-
-st.title("Global Tech & Science Headlines")
-st.markdown("Aggregated headlines from major tech & science news sources (RSS).")
+        # Display left column headline grid (cards side-by-side)
+    n_cols = 3
+        cols = st.columns(n_cols)
+        for idx, row in df.iterrows():
+            c = cols[idx % n_cols]
+            with c:
+                time_str = ''
+                if row['published'] and row['published'].year > 1970:
+                    time_str = row['published'].strftime('%Y-%m-%d %H:%M')
+                title = row['title'] or ''
+                summary = (row['summary'] or '')
+                short = summary[:220] + ('...' if len(summary) > 220 else '')
+                link = row.get('link') or '#'
+                st.markdown(
+                    f"<div class=\"nd-card\">\n  <div class=\"nd-card-title\">{title}</div>\n  <div class=\"nd-card-meta\">{row.get('source')} — {time_str}</div>\n  <div class=\"nd-card-summary\">{short}</div>\n  <div style=\"margin-top:8px;\"><a href=\"{link}\" target=\"_blank\">Open article</a></div>\n</div>",
+                    unsafe_allow_html=True,
+                )
+    .nd-card-meta { color:#6c757d; font-size:12px; margin-bottom:8px; }
+    .nd-card-summary { color:#333; font-size:14px; }
+    .nd-card a { color:#1f77b4; text-decoration:none; }
+    .nd-card:hover { box-shadow: 0 6px 20px rgba(31,119,180,0.08); }
+</style>
+""",
+        unsafe_allow_html=True,
+)
 
 # List of RSS feeds (mix of global & specialized sources)
+# Optimized: prioritize fast, reliable sources for quicker initial load
 DEFAULT_RSS_FEEDS: Dict[str, str] = {
-    "Google News - Technology (Global)": "https://news.google.com/rss/search?q=technology&hl=en-US&gl=US&ceid=US:en",
-    "Google News - Science (Global)": "https://news.google.com/rss/search?q=science&hl=en-US&gl=US&ceid=US:en",
     "BBC Technology": "http://feeds.bbci.co.uk/news/technology/rss.xml",
     "BBC Science": "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
     "The Verge": "https://www.theverge.com/rss/index.xml",
-    "Wired": "https://www.wired.com/feed/rss",
     "Ars Technica": "http://feeds.arstechnica.com/arstechnica/index",
-    "Nature News": "https://www.nature.com/nature.rss",
-    "Science Magazine": "https://www.sciencemag.org/rss/news_current.xml",
-    "MIT Technology Review": "https://www.technologyreview.com/feed/",
     "TechCrunch": "http://feeds.feedburner.com/TechCrunch/",
 }
 
 # Default categories for built-in feeds
 DEFAULT_RSS_FEEDS_CATEGORIES: Dict[str, List[str]] = {
-    "Google News - Technology (Global)": ["technical"],
-    "Google News - Science (Global)": ["science"],
     "BBC Technology": ["technical"],
     "BBC Science": ["science"],
     "The Verge": ["technical"],
-    "Wired": ["technical"],
     "Ars Technica": ["technical"],
-    "Nature News": ["science"],
-    "Science Magazine": ["science"],
-    "MIT Technology Review": ["technical"],
     "TechCrunch": ["technical"],
 }
 
@@ -165,51 +178,85 @@ def deduplicate_df(df, threshold: float = 0.85):
     out = out.sort_values('published', ascending=False).reset_index(drop=True)
     return out
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def fetch_feed(url: str):
-    """Fetch an RSS feed and return parsed feed object."""
+    """Fetch an RSS feed using requests (with timeout) and return parsed feed object.
+
+    Using requests gives us explicit control over timeouts and headers and
+    avoids passing unsupported keyword arguments to feedparser.parse.
+    """
+    import requests
+
+    headers = {'User-Agent': 'Mozilla/5.0 (News-Dashboard)'}
     try:
-        parsed = feedparser.parse(url, request_headers={'User-Agent': 'Mozilla/5.0'})
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
         return parsed
     except Exception:
         return None
 
-@st.cache_data(ttl=600)
-def fetch_all_entries(selected_sources: List[str], feeds_hash: str):
+def _process_feed_entries(name: str, url: str):
+    """Process a single feed and return list of entries."""
+    parsed = fetch_feed(url)
+    if not parsed or not hasattr(parsed, 'entries'):
+        return []
     entries = []
-    for name, url in RSS_FEEDS.items():
-        if selected_sources and name not in selected_sources:
-            continue
-        parsed = fetch_feed(url)
-        if not parsed or not hasattr(parsed, 'entries'):
-            continue
-        for e in parsed.entries:
-            title = e.get('title', '')
-            link = e.get('link', '')
-            summary = e.get('summary', '') or e.get('description', '') or ''
-            # Try to get a published date
-            published = e.get('published') or e.get('updated') or ''
+    for e in parsed.entries:
+        title = e.get('title', '')
+        link = e.get('link', '')
+        summary = e.get('summary', '') or e.get('description', '') or ''
+        published = e.get('published') or e.get('updated') or ''
+        published_parsed = None
+        try:
+            if 'published_parsed' in e and e.published_parsed:
+                published_parsed = datetime(*e.published_parsed[:6])
+            elif published:
+                published_parsed = datetime.fromisoformat(published)
+        except Exception:
             published_parsed = None
-            try:
-                if 'published_parsed' in e and e.published_parsed:
-                    published_parsed = datetime(*e.published_parsed[:6])
-                elif published:
-                    published_parsed = datetime.fromisoformat(published)
-            except Exception:
-                published_parsed = None
+        summary_text = BeautifulSoup(summary, "html.parser").get_text()
+        entries.append({
+            'source': name,
+            'title': title,
+            'link': link,
+            'summary': summary_text,
+            'published': published_parsed,
+        })
+    return entries
 
-            # Clean summary HTML
-            summary_text = BeautifulSoup(summary, "html.parser").get_text()
-
-            entries.append(
-                {
-                    'source': name,
-                    'title': title,
-                    'link': link,
-                    'summary': summary_text,
-                    'published': published_parsed,
-                }
-            )
+@st.cache_data(ttl=1800)
+def fetch_all_entries(selected_sources: List[str], feeds_hash: str):
+    """Fetch all entries from selected feeds using concurrent requests."""
+    entries = []
+    
+    # Build list of feeds to fetch
+    feeds_to_fetch = [(name, url) for name, url in RSS_FEEDS.items() 
+                      if not selected_sources or name in selected_sources]
+    
+    # Fetch feeds concurrently
+    if feeds_to_fetch:
+        progress_placeholder = st.empty()
+        with ThreadPoolExecutor(max_workers=min(5, len(feeds_to_fetch))) as executor:
+            future_to_name = {}
+            for name, url in feeds_to_fetch:
+                future = executor.submit(_process_feed_entries, name, url)
+                future_to_name[future] = name
+            
+            completed = 0
+            for future in as_completed(future_to_name):
+                completed += 1
+                try:
+                    result = future.result(timeout=15)
+                    entries.extend(result)
+                except Exception:
+                    pass  # silently skip failed feeds
+                
+                # Update progress
+                progress_placeholder.info(f"Loading... {completed}/{len(feeds_to_fetch)} feeds fetched")
+        
+        progress_placeholder.empty()
+    
     if not entries:
         return pd.DataFrame(columns=['source', 'title', 'link', 'summary', 'published'])
     df = pd.DataFrame(entries)
@@ -427,23 +474,49 @@ else:
                 time_str = row['published'].strftime('%Y-%m-%d %H:%M')
             label = f"{row['title'][:60]}... ({row['source']}) — {time_str}"
             headline_labels.append(label)
-        
-        if headline_labels:
-            selected_label = st.selectbox("Choose an article:", options=headline_labels, index=0)
-            sel_idx = headline_labels.index(selected_label)
-        else:
-            sel_idx = 0
+        # Use query param to allow clickable card selection (e.g. ?selected=3)
+        qparams = st.experimental_get_query_params()
+        if 'selected' in qparams:
+            try:
+                qidx = int(qparams.get('selected', [0])[0])
+                st.session_state['selected_idx'] = max(0, min(qidx, len(headline_labels) - 1))
+            except Exception:
+                pass
 
-    # Display left column headline list
+        # Ensure a selected index in session state
+        if 'selected_idx' not in st.session_state:
+            st.session_state['selected_idx'] = 0
+
+        if headline_labels:
+            # keep the selectbox in sync with session state
+            current_index = min(st.session_state.get('selected_idx', 0), len(headline_labels) - 1)
+            selected_label = st.selectbox("Choose an article:", options=headline_labels, index=current_index)
+            sel_idx = headline_labels.index(selected_label)
+            st.session_state['selected_idx'] = sel_idx
+        else:
+            sel_idx = st.session_state.get('selected_idx', 0)
+
+    # Display left column headline grid (cards side-by-side)
     with left:
-        # show a compact table of headlines
+        # show counts (already displayed in header) and render cards
+        n_cols = 3
+        cols = st.columns(n_cols)
         for idx, row in df.iterrows():
-            time_str = ''
-            if row['published'] and row['published'].year > 1970:
-                time_str = row['published'].strftime('%Y-%m-%d %H:%M')
-            st.markdown(f"**{row['title']}**  \\n*{row['source']} — {time_str}*  \\n{row['summary'][:250]}{'...' if len(row['summary'])>250 else ''}")
-            st.markdown(f"[Open article]({row['link']})")
-            st.markdown('---')
+            c = cols[idx % n_cols]
+            with c:
+                time_str = ''
+                if row['published'] and row['published'].year > 1970:
+                    time_str = row['published'].strftime('%Y-%m-%d %H:%M')
+                title = row['title'] or ''
+                summary = (row['summary'] or '')
+                short = summary[:220] + ('...' if len(summary) > 220 else '')
+                link = row.get('link') or '#'
+                # Title becomes a link that sets the `selected` query param so clicking it selects the article
+                select_href = f"?selected={idx}"
+                st.markdown(
+                    f"<div class=\"nd-card\">\n  <div class=\"nd-card-title\"><a href=\"{select_href}\">{title}</a></div>\n  <div class=\"nd-card-meta\">{row.get('source')} — {time_str}</div>\n  <div class=\"nd-card-summary\">{short}</div>\n  <div style=\"margin-top:8px;\"><a href=\"{link}\" target=\"_blank\">Open article</a></div>\n</div>",
+                    unsafe_allow_html=True,
+                )
 
     with right:
         st.subheader("Article details")
