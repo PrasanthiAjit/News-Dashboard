@@ -235,8 +235,13 @@ def _process_feed_entries(name: str, url: str):
     return entries
 
 @st.cache_data(ttl=1800)
-def fetch_all_entries(selected_sources: List[str], feeds_hash: str):
-    """Fetch all entries from selected sources using concurrent execution."""
+def fetch_all_entries(selected_sources: tuple, sources_key: tuple):
+    """Fetch all entries from selected sources using concurrent execution.
+    
+    Args:
+        selected_sources: tuple of source names to fetch (for behavior)
+        sources_key: tuple of sorted selected source names (cache key)
+    """
     entries = []
     
     # Use ThreadPoolExecutor for concurrent fetching (max 5 workers)
@@ -430,9 +435,10 @@ if st.sidebar.button("Save sources"):
         st.sidebar.error(f"Failed to save sources: {e}")
 
 # Fetch entries
-feeds_hash = str(sorted(RSS_FEEDS.items()))
-with st.spinner("Fetching feeds… (cached for 10 minutes)" if not refresh else "Refreshing feeds…"):
-    raw_df = fetch_all_entries(selected, feeds_hash)
+# Create stable cache key from sorted selected sources
+sources_key = tuple(sorted(selected))
+with st.spinner("Fetching feeds… (cached for 30 minutes)" if not refresh else "Refreshing feeds…"):
+    raw_df = fetch_all_entries(tuple(selected), sources_key)
     original_count = 0 if raw_df is None else len(raw_df)
     # Deduplicate across different sources (fuzzy title matching)
     try:
